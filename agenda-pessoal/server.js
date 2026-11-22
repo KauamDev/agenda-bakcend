@@ -2,139 +2,276 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
 
 const PORT = process.env.PORT || 3001;
 const PUBLIC_DIR = __dirname;
-const DB_FILE = path.join(__dirname, 'agenda.db');
 const MAX_BODY_SIZE = 512 * 1024; // 512KB
-
-// Inicializa banco de dados SQLite persistente em disco
-const db = new DatabaseSync(DB_FILE);
-
-// =========================================================================
-// OTIMIZAÇÕES DE ALTA CONCORRÊNCIA E SEGURANÇA SQLITE (MODO WAL)
-// =========================================================================
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA synchronous = NORMAL;');
-db.exec('PRAGMA busy_timeout = 10000;');
-db.exec('PRAGMA cache_size = -32000;');
-db.exec('PRAGMA foreign_keys = ON;');
-
-// =========================================================================
-// SCHEMA RELACIONAL ROBUSTO
-// =========================================================================
-db.exec(`
-  CREATE TABLE IF NOT EXISTS usuarios (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome TEXT NOT NULL,
-    email TEXT UNIQUE COLLATE NOCASE NOT NULL,
-    senha_hash TEXT NOT NULL,
-    salt TEXT NOT NULL,
-    criado_em TEXT DEFAULT (datetime('now', 'localtime'))
-  );
-
-  CREATE TABLE IF NOT EXISTS sessoes (
-    token TEXT PRIMARY KEY,
-    usuario_id INTEGER NOT NULL,
-    expira_em INTEGER NOT NULL,
-    criado_em TEXT DEFAULT (datetime('now', 'localtime')),
-    FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS tokens_recuperacao (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    usuario_id INTEGER NOT NULL,
-    codigo TEXT NOT NULL,
-    expira_em INTEGER NOT NULL,
-    usado INTEGER DEFAULT 0,
-    criado_em TEXT DEFAULT (datetime('now', 'localtime')),
-    FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS compromissos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    usuario_id INTEGER NOT NULL,
-    titulo TEXT NOT NULL,
-    descricao TEXT DEFAULT '',
-    data TEXT NOT NULL,
-    horario TEXT DEFAULT '',
-    categoria TEXT DEFAULT 'Geral',
-    concluido INTEGER DEFAULT 0,
-    criado_em TEXT DEFAULT (datetime('now', 'localtime')),
-    FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_comp_user ON compromissos(usuario_id, data);
-  CREATE INDEX IF NOT EXISTS idx_comp_horario ON compromissos(usuario_id, data, horario);
-  CREATE INDEX IF NOT EXISTS idx_sess_token ON sessoes(token);
-  CREATE INDEX IF NOT EXISTS idx_recup_user ON tokens_recuperacao(usuario_id, codigo);
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_email_nocase ON usuarios(email COLLATE NOCASE);
-`);
-
-// Limpa sessões expiradas ao iniciar
-try {
-  db.prepare('DELETE FROM sessoes WHERE expira_em < ?').run(Date.now());
-  db.prepare('DELETE FROM tokens_recuperacao WHERE expira_em < ? OR usado = 1').run(Date.now());
-} catch (e) {}
-
-console.log('🛡️ Servidor SQLite WAL + Segurança Ativa rodando na porta', PORT);
-
-const ALLOWED_CATEGORIES = ['Trabalho', 'Pessoal', 'Finanças', 'Lembrete', 'Urgente', 'Geral'];
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://neondb_owner:npg_icUl2CKuj4OR@ep-round-star-be2z9ker-pooler.c-9.us-east-2.aws.neon.tech/neondb?sslmode=require';
 
 // =========================================================================
-// ENVIO DE E-MAILS DE RECUPERAÇÃO VIA RESEND (TRANSACTIONAL EMAIL)
+// CAMADA DE PERSISTÊNCIA DEDICADA: NEON POSTGRESQL (NUNCA PERDE DADOS)
 // =========================================================================
-async function enviarEmailRecuperacao(destinatario, codigo) {
-  if (!RESEND_API_KEY) {
-    console.log(`[SIMULAÇÃO] RESEND_API_KEY não definida. Código para ${destinatario}: ${codigo}`);
-    return { enviado: false, motivo: 'Chave RESEND_API_KEY não configurada' };
-  }
+let pgPool = null;
+let sqliteDb = null;
+let isPostgres = false;
+
+if (DATABASE_URL) {
   try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        from: 'Agenda Pessoal Segura <onboarding@resend.dev>',
-        to: destinatario,
-        subject: 'Código de Recuperação de Senha - Agenda Farofa',
-        html: `
-          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 28px; background: #0B0E14; color: #FFFFFF; border-radius: 12px; border: 1px solid #1E2538;">
-            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
-              <div style="width: 36px; height: 36px; background: #6366F1; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: bold; text-align: center; line-height: 36px;">📅</div>
-              <h2 style="margin: 0; font-size: 20px; color: #FFFFFF;">AGENDA PESSOAL</h2>
-            </div>
-            <p style="font-size: 15px; color: #94A3B8; line-height: 1.5;">Você solicitou a recuperação de acesso à sua conta.</p>
-            <p style="font-size: 14px; color: #CBD5E1; margin-top: 16px;">Seu código de verificação temporário é:</p>
-            <div style="margin: 20px 0; padding: 16px; background: #151A26; border: 1px dashed #6366F1; border-radius: 8px; text-align: center;">
-              <span style="font-family: monospace; font-size: 32px; font-weight: 700; letter-spacing: 6px; color: #10B981;">${codigo}</span>
-            </div>
-            <p style="font-size: 13px; color: #64748B; line-height: 1.4;">
-              ⏳ Este código expira em <strong>15 minutos</strong> e só pode ser usado uma única vez.<br>
-              Se você não solicitou a redefinição de senha, ignore este e-mail.
-            </p>
-          </div>
-        `
-      })
+    const { Pool } = require('pg');
+    pgPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
     });
-    const resData = await res.json();
-    return { enviado: res.ok, resData };
+    isPostgres = true;
+    console.log('🐘 Conectado ao Neon PostgreSQL (Persistência Permanente 24/7 Ativa)');
+
+    // Inicializa schema no PostgreSQL
+    pgPool.query(`
+      CREATE TABLE IF NOT EXISTS usuarios (
+        id SERIAL PRIMARY KEY,
+        nome VARCHAR(100) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        senha_hash VARCHAR(255) NOT NULL,
+        salt VARCHAR(64) NOT NULL,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS sessoes (
+        token VARCHAR(64) PRIMARY KEY,
+        usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+        expira_em BIGINT NOT NULL,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS tokens_recuperacao (
+        id SERIAL PRIMARY KEY,
+        usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+        codigo VARCHAR(10) NOT NULL,
+        expira_em BIGINT NOT NULL,
+        usado INTEGER DEFAULT 0,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS compromissos (
+        id SERIAL PRIMARY KEY,
+        usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+        titulo VARCHAR(100) NOT NULL,
+        descricao TEXT DEFAULT '',
+        data VARCHAR(10) NOT NULL,
+        horario VARCHAR(10) DEFAULT '',
+        categoria VARCHAR(50) DEFAULT 'Geral',
+        concluido INTEGER DEFAULT 0,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pg_comp_user ON compromissos(usuario_id, data);
+      CREATE INDEX IF NOT EXISTS idx_pg_sess_token ON sessoes(token);
+    `).catch(err => console.error('Erro ao verificar schema Postgres:', err));
   } catch (err) {
-    console.error('Erro ao enviar e-mail via Resend:', err);
-    return { enviado: false, erro: err.message };
+    console.warn('Driver pg não encontrado. Recorrendo a SQLite local...', err.message);
   }
 }
+
+if (!isPostgres) {
+  const { DatabaseSync } = require('node:sqlite');
+  const DB_FILE = path.join(__dirname, 'agenda.db');
+  sqliteDb = new DatabaseSync(DB_FILE);
+  sqliteDb.exec('PRAGMA journal_mode = WAL;');
+  sqliteDb.exec('PRAGMA synchronous = NORMAL;');
+  sqliteDb.exec('PRAGMA busy_timeout = 10000;');
+  sqliteDb.exec('PRAGMA foreign_keys = ON;');
+  console.log('📁 Modo SQLite local ativo');
+}
+
+// =========================================================================
+// MÉTODOS ABSTRATOS DO BANCO DE DADOS (SUPORTA POSTGRES E SQLITE)
+// =========================================================================
+const DB = {
+  async getUsuarioByEmail(email) {
+    const clean = email.trim().toLowerCase();
+    if (isPostgres) {
+      const res = await pgPool.query('SELECT * FROM usuarios WHERE LOWER(email) = LOWER($1)', [clean]);
+      return res.rows[0] || null;
+    } else {
+      return sqliteDb.prepare('SELECT * FROM usuarios WHERE email = ? COLLATE NOCASE').get(clean) || null;
+    }
+  },
+
+  async createUsuario(nome, email, hash, salt) {
+    const clean = email.trim().toLowerCase();
+    if (isPostgres) {
+      const res = await pgPool.query(
+        'INSERT INTO usuarios (nome, email, senha_hash, salt) VALUES ($1, $2, $3, $4) RETURNING id, nome, email',
+        [nome.trim(), clean, hash, salt]
+      );
+      return res.rows[0];
+    } else {
+      const stmt = sqliteDb.prepare('INSERT INTO usuarios (nome, email, senha_hash, salt) VALUES (?, ?, ?, ?)');
+      const r = stmt.run(nome.trim(), clean, hash, salt);
+      return { id: r.lastInsertRowid, nome: nome.trim(), email: clean };
+    }
+  },
+
+  async getSession(token, now) {
+    if (isPostgres) {
+      const res = await pgPool.query(`
+        SELECT s.token, u.id, u.nome, u.email 
+        FROM sessoes s
+        JOIN usuarios u ON u.id = s.usuario_id
+        WHERE s.token = $1 AND s.expira_em > $2
+      `, [token, now]);
+      return res.rows[0] || null;
+    } else {
+      const stmt = sqliteDb.prepare(`
+        SELECT s.token, u.id, u.nome, u.email 
+        FROM sessoes s
+        JOIN usuarios u ON u.id = s.usuario_id
+        WHERE s.token = ? AND s.expira_em > ?
+      `);
+      return stmt.get(token, now) || null;
+    }
+  },
+
+  async createSession(token, userId, expiraEm) {
+    if (isPostgres) {
+      await pgPool.query('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES ($1, $2, $3)', [token, userId, expiraEm]);
+    } else {
+      sqliteDb.prepare('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, ?)').run(token, userId, expiraEm);
+    }
+  },
+
+  async deleteSession(token) {
+    if (isPostgres) {
+      await pgPool.query('DELETE FROM sessoes WHERE token = $1', [token]);
+    } else {
+      sqliteDb.prepare('DELETE FROM sessoes WHERE token = ?').run(token);
+    }
+  },
+
+  async createRecoveryToken(userId, codigo, expiraEm) {
+    if (isPostgres) {
+      await pgPool.query('UPDATE tokens_recuperacao SET usado = 1 WHERE usuario_id = $1', [userId]);
+      await pgPool.query('INSERT INTO tokens_recuperacao (usuario_id, codigo, expira_em) VALUES ($1, $2, $3)', [userId, codigo, expiraEm]);
+    } else {
+      sqliteDb.prepare('UPDATE tokens_recuperacao SET usado = 1 WHERE usuario_id = ?').run(userId);
+      sqliteDb.prepare('INSERT INTO tokens_recuperacao (usuario_id, codigo, expira_em) VALUES (?, ?, ?)').run(userId, codigo, expiraEm);
+    }
+  },
+
+  async getValidRecoveryToken(userId, codigo, now) {
+    if (isPostgres) {
+      const res = await pgPool.query(`
+        SELECT id FROM tokens_recuperacao 
+        WHERE usuario_id = $1 AND codigo = $2 AND usado = 0 AND expira_em > $3
+      `, [userId, codigo, now]);
+      return res.rows[0] || null;
+    } else {
+      return sqliteDb.prepare(`
+        SELECT id FROM tokens_recuperacao 
+        WHERE usuario_id = ? AND codigo = ? AND usado = 0 AND expira_em > ?
+      `).get(userId, codigo, now) || null;
+    }
+  },
+
+  async updatePasswordAndRevoke(userId, hash, salt, tokenId) {
+    if (isPostgres) {
+      await pgPool.query('UPDATE usuarios SET senha_hash = $1, salt = $2 WHERE id = $3', [hash, salt, userId]);
+      await pgPool.query('UPDATE tokens_recuperacao SET usado = 1 WHERE id = $1', [tokenId]);
+      await pgPool.query('DELETE FROM sessoes WHERE usuario_id = $1', [userId]);
+    } else {
+      sqliteDb.prepare('UPDATE usuarios SET senha_hash = ?, salt = ? WHERE id = ?').run(hash, salt, userId);
+      sqliteDb.prepare('UPDATE tokens_recuperacao SET usado = 1 WHERE id = ?').run(tokenId);
+      sqliteDb.prepare('DELETE FROM sessoes WHERE usuario_id = ?').run(userId);
+    }
+  },
+
+  async getCompromissos(userId) {
+    if (isPostgres) {
+      const res = await pgPool.query(`
+        SELECT id, titulo, descricao, data, horario, categoria, concluido, criado_em 
+        FROM compromissos 
+        WHERE usuario_id = $1 
+        ORDER BY data ASC, horario ASC, id DESC
+      `, [userId]);
+      return res.rows;
+    } else {
+      return sqliteDb.prepare(`
+        SELECT id, titulo, descricao, data, horario, categoria, concluido, criado_em 
+        FROM compromissos 
+        WHERE usuario_id = ? 
+        ORDER BY data ASC, horario ASC, id DESC
+      `).all(userId);
+    }
+  },
+
+  async checkConflict(userId, data, horario) {
+    if (!horario) return null;
+    if (isPostgres) {
+      const res = await pgPool.query(`
+        SELECT id, titulo FROM compromissos 
+        WHERE usuario_id = $1 AND data = $2 AND horario = $3 AND concluido = 0
+      `, [userId, data, horario]);
+      return res.rows[0] || null;
+    } else {
+      return sqliteDb.prepare(`
+        SELECT id, titulo FROM compromissos 
+        WHERE usuario_id = ? AND data = ? AND horario = ? AND concluido = 0
+      `).get(userId, data, horario) || null;
+    }
+  },
+
+  async createCompromisso(userId, titulo, descricao, data, horario, categoria) {
+    if (isPostgres) {
+      const res = await pgPool.query(`
+        INSERT INTO compromissos (usuario_id, titulo, descricao, data, horario, categoria, concluido)
+        VALUES ($1, $2, $3, $4, $5, $6, 0)
+        RETURNING *
+      `, [userId, titulo, descricao, data, horario, categoria]);
+      return res.rows[0];
+    } else {
+      const stmt = sqliteDb.prepare(`
+        INSERT INTO compromissos (usuario_id, titulo, descricao, data, horario, categoria, concluido)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+      `);
+      const r = stmt.run(userId, titulo, descricao, data, horario, categoria);
+      return sqliteDb.prepare('SELECT * FROM compromissos WHERE id = ? AND usuario_id = ?').get(r.lastInsertRowid, userId);
+    }
+  },
+
+  async updateStatus(id, userId, concluido) {
+    const val = concluido ? 1 : 0;
+    if (isPostgres) {
+      const res = await pgPool.query(
+        'UPDATE compromissos SET concluido = $1 WHERE id = $2 AND usuario_id = $3 RETURNING *',
+        [val, id, userId]
+      );
+      return res.rows[0] || null;
+    } else {
+      sqliteDb.prepare('UPDATE compromissos SET concluido = ? WHERE id = ? AND usuario_id = ?').run(val, id, userId);
+      return sqliteDb.prepare('SELECT * FROM compromissos WHERE id = ? AND usuario_id = ?').get(id, userId);
+    }
+  },
+
+  async deleteCompromisso(id, userId) {
+    if (isPostgres) {
+      const res = await pgPool.query('DELETE FROM compromissos WHERE id = $1 AND usuario_id = $2', [id, userId]);
+      return res.rowCount > 0;
+    } else {
+      const r = sqliteDb.prepare('DELETE FROM compromissos WHERE id = ? AND usuario_id = ?').run(id, userId);
+      return r.changes > 0;
+    }
+  }
+};
+
+const ALLOWED_CATEGORIES = ['Trabalho', 'Pessoal', 'Finanças', 'Lembrete', 'Urgente', 'Geral'];
 
 // =========================================================================
 // ANTI-FORÇA BRUTA (RATE LIMITING EM MEMÓRIA)
 // =========================================================================
-const loginAttempts = new Map(); // key: ip ou email, value: { count, blockUntil }
+const loginAttempts = new Map();
 const MAX_FAILED_ATTEMPTS = 5;
-const BLOCK_DURATION_MS = 15 * 60 * 1000; // 15 minutos
+const BLOCK_DURATION_MS = 15 * 60 * 1000;
 
 function getClientIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || '127.0.0.1';
@@ -167,7 +304,7 @@ function resetFailedAttempts(key) {
 }
 
 // =========================================================================
-// CRIPTOGRAFIA E VALIDAÇÃO DE SENHAS
+// CRIPTOGRAFIA
 // =========================================================================
 function validarSenhaForte(senha) {
   if (typeof senha !== 'string') return false;
@@ -196,23 +333,15 @@ function verificarSenha(senhaDigitada, salt, hashArmazenado) {
   }
 }
 
-// Middleware de autenticação com checagem de expiração
-function autenticarRequisicao(req) {
+// Middleware de autenticação
+async function autenticarRequisicao(req) {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
   const token = authHeader.substring(7).trim();
   if (!token || token.length !== 64) return null;
 
   try {
-    const agora = Date.now();
-    const stmt = db.prepare(`
-      SELECT s.token, u.id, u.nome, u.email 
-      FROM sessoes s
-      JOIN usuarios u ON u.id = s.usuario_id
-      WHERE s.token = ? AND s.expira_em > ?
-    `);
-    const session = stmt.get(token, agora);
-    return session || null;
+    return await DB.getSession(token, Date.now());
   } catch (err) {
     return null;
   }
@@ -229,7 +358,6 @@ function setSecurityHeaders(res, origin) {
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';"
   );
 
-  // CORS seguro
   const allowedOrigins = ['https://agendafarofa.netlify.app', 'https://farofateste.netlify.app'];
   if (origin && (allowedOrigins.includes(origin) || origin.startsWith('http://localhost:'))) {
     res.setHeader('Access-Control-Allow-Origin', origin);
@@ -250,13 +378,56 @@ function sendJSON(res, status, data, origin) {
   res.end(JSON.stringify(data));
 }
 
-// Data atual no fuso de São Paulo (America/Sao_Paulo)
 function getHojeSaoPaulo() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date());
 }
 
-// Servidor principal
-const server = http.createServer((req, res) => {
+async function enviarEmailRecuperacao(destinatario, codigo) {
+  if (!RESEND_API_KEY) {
+    console.log(`[RESEND] Sem chave configurada. Código gerado no servidor para [${destinatario}]: ${codigo}`);
+    return { enviado: false, motivo: 'Sem chave RESEND_API_KEY' };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: 'Agenda Pessoal Segura <onboarding@resend.dev>',
+        to: destinatario,
+        subject: 'Código de Recuperação de Senha - Agenda Pessoal',
+        html: `
+          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 28px; background: #0B0E14; color: #FFFFFF; border-radius: 12px; border: 1px solid #1E2538;">
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
+              <div style="width: 36px; height: 36px; background: #3B82F6; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 20px; text-align: center; line-height: 36px;">📅</div>
+              <h2 style="margin: 0; font-size: 20px; color: #FFFFFF;">AGENDA PESSOAL</h2>
+            </div>
+            <p style="font-size: 15px; color: #94A3B8; line-height: 1.5;">Você solicitou a recuperação de acesso à sua conta.</p>
+            <p style="font-size: 14px; color: #CBD5E1; margin-top: 16px;">Seu código de verificação temporário é:</p>
+            <div style="margin: 20px 0; padding: 16px; background: #151A26; border: 1px dashed #3B82F6; border-radius: 8px; text-align: center;">
+              <span style="font-family: monospace; font-size: 32px; font-weight: 700; letter-spacing: 6px; color: #10B981;">${codigo}</span>
+            </div>
+            <p style="font-size: 13px; color: #64748B; line-height: 1.4;">
+              ⏳ Este código expira em <strong>15 minutos</strong> e só pode ser usado uma única vez.<br>
+              Se você não solicitou a redefinição de senha, ignore este e-mail.
+            </p>
+          </div>
+        `
+      })
+    });
+    return { enviado: res.ok };
+  } catch (err) {
+    console.error('Erro Resend:', err);
+    return { enviado: false, erro: err.message };
+  }
+}
+
+// =========================================================================
+// SERVIDOR HTTP COM ROTAS ASSÍNCRONAS
+// =========================================================================
+const server = http.createServer(async (req, res) => {
   const origin = req.headers['origin'];
   setSecurityHeaders(res, origin);
 
@@ -270,10 +441,6 @@ const server = http.createServer((req, res) => {
   const pathname = parsedUrl.pathname;
   const method = req.method;
 
-  // =========================================================================
-  // ROTAS DE AUTENTICAÇÃO
-  // =========================================================================
-
   // 1. POST /api/auth/cadastro
   if (method === 'POST' && pathname === '/api/auth/cadastro') {
     let body = '';
@@ -283,58 +450,45 @@ const server = http.createServer((req, res) => {
       if (bodyLength > MAX_BODY_SIZE) req.destroy();
       body += chunk;
     });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { nome, email, senha } = JSON.parse(body);
 
-        // Validação estrita de nome
-        if (!nome || typeof nome !== 'string') {
-          return sendJSON(res, 400, { error: 'Nome é obrigatório.' }, origin);
-        }
+        if (!nome || typeof nome !== 'string') return sendJSON(res, 400, { error: 'Nome é obrigatório.' }, origin);
         const nomeTrim = nome.trim();
-        if (nomeTrim.length < 2 || nomeTrim.length > 60) {
-          return sendJSON(res, 400, { error: 'O nome deve ter entre 2 e 60 caracteres.' }, origin);
-        }
+        if (nomeTrim.length < 2 || nomeTrim.length > 60) return sendJSON(res, 400, { error: 'O nome deve ter entre 2 e 60 caracteres.' }, origin);
         if (!/^[A-Za-zÀ-ÖØ-öø-ÿ\s'-]+$/.test(nomeTrim)) {
           return sendJSON(res, 400, { error: 'O nome deve conter apenas letras e espaços (sem números ou símbolos).' }, origin);
         }
 
-        // Validação e normalização estrita de email
-        if (!email || typeof email !== 'string') {
-          return sendJSON(res, 400, { error: 'E-mail é obrigatório.' }, origin);
-        }
+        if (!email || typeof email !== 'string') return sendJSON(res, 400, { error: 'E-mail é obrigatório.' }, origin);
         const emailClean = email.trim().toLowerCase();
         if (emailClean.length > 120 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailClean)) {
           return sendJSON(res, 400, { error: 'Informe um endereço de e-mail válido.' }, origin);
         }
 
-        // Validação de senha forte
         if (!validarSenhaForte(senha)) {
           return sendJSON(res, 400, { 
             error: 'Senha fraca. Mínimo 8 caracteres com maiúscula, minúscula, número e símbolo especial (!@#$).' 
           }, origin);
         }
 
-        // Validação no banco (Collate NOCASE)
-        const existe = db.prepare('SELECT id FROM usuarios WHERE email = ? COLLATE NOCASE').get(emailClean);
+        const existe = await DB.getUsuarioByEmail(emailClean);
         if (existe) {
           return sendJSON(res, 409, { error: 'Este e-mail já está cadastrado. Faça login na sua conta.' }, origin);
         }
 
         const { salt, hash } = gerarHashSenha(senha);
-        const stmt = db.prepare('INSERT INTO usuarios (nome, email, senha_hash, salt) VALUES (?, ?, ?, ?)');
-        const result = stmt.run(nomeTrim, emailClean, hash, salt);
-        const novoUsuarioId = result.lastInsertRowid;
+        const novoUsuario = await DB.createUsuario(nomeTrim, emailClean, hash, salt);
 
-        // Token de sessão criptográfico (7 dias de expiração)
         const token = crypto.randomBytes(32).toString('hex');
         const expiraEm = Date.now() + (7 * 24 * 60 * 60 * 1000);
-        db.prepare('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, ?)').run(token, novoUsuarioId, expiraEm);
+        await DB.createSession(token, novoUsuario.id, expiraEm);
 
         return sendJSON(res, 201, {
           success: true,
           token,
-          usuario: { id: novoUsuarioId, nome: nomeTrim, email: emailClean }
+          usuario: { id: novoUsuario.id, nome: novoUsuario.nome, email: novoUsuario.email }
         }, origin);
       } catch (err) {
         return sendJSON(res, 400, { error: 'Requisição inválida.' }, origin);
@@ -352,12 +506,11 @@ const server = http.createServer((req, res) => {
       if (bodyLength > MAX_BODY_SIZE) req.destroy();
       body += chunk;
     });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { email, senha } = JSON.parse(body);
         const emailClean = (email || '').trim().toLowerCase();
 
-        // Checagem de rate limit por IP e por email
         const rateCheckIP = checkRateLimit(`ip_${clientIP}`);
         if (rateCheckIP.blocked) {
           return sendJSON(res, 429, { 
@@ -377,20 +530,19 @@ const server = http.createServer((req, res) => {
           return sendJSON(res, 400, { error: 'Informe e-mail e senha.' }, origin);
         }
 
-        const usuario = db.prepare('SELECT * FROM usuarios WHERE email = ? COLLATE NOCASE').get(emailClean);
+        const usuario = await DB.getUsuarioByEmail(emailClean);
         if (!usuario || !verificarSenha(senha, usuario.salt, usuario.senha_hash)) {
           recordFailedAttempt(`ip_${clientIP}`);
           recordFailedAttempt(`email_${emailClean}`);
           return sendJSON(res, 401, { error: 'E-mail ou senha incorretos.' }, origin);
         }
 
-        // Sucesso: reseta tentativas
         resetFailedAttempts(`ip_${clientIP}`);
         resetFailedAttempts(`email_${emailClean}`);
 
         const token = crypto.randomBytes(32).toString('hex');
         const expiraEm = Date.now() + (7 * 24 * 60 * 60 * 1000);
-        db.prepare('INSERT INTO sessoes (token, usuario_id, expira_em) VALUES (?, ?, ?)').run(token, usuario.id, expiraEm);
+        await DB.createSession(token, usuario.id, expiraEm);
 
         return sendJSON(res, 200, {
           success: true,
@@ -408,40 +560,31 @@ const server = http.createServer((req, res) => {
   if (method === 'POST' && pathname === '/api/auth/recuperar-senha') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { email } = JSON.parse(body);
         const emailClean = (email || '').trim().toLowerCase();
         if (!emailClean) return sendJSON(res, 400, { error: 'Informe o e-mail.' }, origin);
 
-        const usuario = db.prepare('SELECT id FROM usuarios WHERE email = ? COLLATE NOCASE').get(emailClean);
+        const usuario = await DB.getUsuarioByEmail(emailClean);
         if (usuario) {
-          // Gera código de 6 dígitos numéricos
           const codigo = crypto.randomInt(100000, 999999).toString();
-          const expiraEm = Date.now() + (15 * 60 * 1000); // 15 minutos
+          const expiraEm = Date.now() + (15 * 60 * 1000);
 
-          // Invalida códigos anteriores
-          db.prepare('UPDATE tokens_recuperacao SET usado = 1 WHERE usuario_id = ?').run(usuario.id);
-          db.prepare('INSERT INTO tokens_recuperacao (usuario_id, codigo, expira_em) VALUES (?, ?, ?)').run(usuario.id, codigo, expiraEm);
+          await DB.createRecoveryToken(usuario.id, codigo, expiraEm);
+          console.log(`🔑 CÓDIGO DE RECUPERAÇÃO GERADO PARA [${emailClean}]: ${codigo}`);
 
-          console.log(`🔑 CÓDIGO DE RECUPERAÇÃO PARA [${emailClean}]: ${codigo}`);
-          enviarEmailRecuperacao(emailClean, codigo).then(resultado => {
-            console.log('Status do envio de e-mail Resend:', resultado);
-          });
+          enviarEmailRecuperacao(emailClean, codigo).catch(console.error);
 
           return sendJSON(res, 200, { 
             success: true, 
-            message: RESEND_API_KEY 
-              ? 'Código de recuperação enviado para seu e-mail! Verifique sua caixa de entrada.' 
-              : 'Código de recuperação gerado (Modo Simulação). Válido por 15 minutos.',
-            codigoSimulado: RESEND_API_KEY ? undefined : codigo
+            message: 'Código de recuperação enviado para seu e-mail! Verifique sua caixa de entrada e spam.'
           }, origin);
         }
 
-        // Mensagem genérica mesmo se o email não existir (evita enumeração de usuários)
         return sendJSON(res, 200, { 
           success: true, 
-          message: 'Se o e-mail estiver cadastrado, o código de recuperação foi enviado.' 
+          message: 'Se o e-mail estiver cadastrado, um código de verificação foi enviado. Verifique sua caixa de entrada e spam.' 
         }, origin);
       } catch (e) {
         return sendJSON(res, 400, { error: 'Requisição inválida.' }, origin);
@@ -454,7 +597,7 @@ const server = http.createServer((req, res) => {
   if (method === 'POST' && pathname === '/api/auth/redefinir-senha') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { email, codigo, novaSenha } = JSON.parse(body);
         const emailClean = (email || '').trim().toLowerCase();
@@ -470,29 +613,14 @@ const server = http.createServer((req, res) => {
           }, origin);
         }
 
-        const usuario = db.prepare('SELECT id FROM usuarios WHERE email = ? COLLATE NOCASE').get(emailClean);
-        if (!usuario) {
-          return sendJSON(res, 400, { error: 'Código inválido ou expirado.' }, origin);
-        }
+        const usuario = await DB.getUsuarioByEmail(emailClean);
+        if (!usuario) return sendJSON(res, 400, { error: 'Código inválido ou expirado.' }, origin);
 
-        const recup = db.prepare(`
-          SELECT id FROM tokens_recuperacao 
-          WHERE usuario_id = ? AND codigo = ? AND usado = 0 AND expira_em > ?
-        `).get(usuario.id, codigoClean, Date.now());
+        const recup = await DB.getValidRecoveryToken(usuario.id, codigoClean, Date.now());
+        if (!recup) return sendJSON(res, 400, { error: 'Código de recuperação inválido ou expirado.' }, origin);
 
-        if (!recup) {
-          return sendJSON(res, 400, { error: 'Código de recuperação inválido ou expirado.' }, origin);
-        }
-
-        // Atualiza senha com novo salt e hash
         const { salt, hash } = gerarHashSenha(novaSenha);
-        db.prepare('UPDATE usuarios SET senha_hash = ?, salt = ? WHERE id = ?').run(hash, salt, usuario.id);
-        
-        // Marca código como usado
-        db.prepare('UPDATE tokens_recuperacao SET usado = 1 WHERE id = ?').run(recup.id);
-        
-        // Revoga todas as sessões ativas do usuário por segurança
-        db.prepare('DELETE FROM sessoes WHERE usuario_id = ?').run(usuario.id);
+        await DB.updatePasswordAndRevoke(usuario.id, hash, salt, recup.id);
 
         return sendJSON(res, 200, { 
           success: true, 
@@ -507,7 +635,7 @@ const server = http.createServer((req, res) => {
 
   // 5. GET /api/auth/me
   if (method === 'GET' && pathname === '/api/auth/me') {
-    const session = autenticarRequisicao(req);
+    const session = await autenticarRequisicao(req);
     if (!session) return sendJSON(res, 401, { error: 'Sessão inválida ou expirada.' }, origin);
     return sendJSON(res, 200, {
       usuario: { id: session.id, nome: session.nome, email: session.email }
@@ -519,37 +647,27 @@ const server = http.createServer((req, res) => {
     const authHeader = req.headers['authorization'];
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.substring(7).trim();
-      db.prepare('DELETE FROM sessoes WHERE token = ?').run(token);
+      await DB.deleteSession(token);
     }
     return sendJSON(res, 200, { success: true }, origin);
   }
 
-  // =========================================================================
-  // ROTAS DE COMPROMISSOS COM ISOLAMENTO RIGOROSO
-  // =========================================================================
-
-  // GET /api/compromissos
+  // 7. GET /api/compromissos
   if (method === 'GET' && pathname === '/api/compromissos') {
-    const session = autenticarRequisicao(req);
+    const session = await autenticarRequisicao(req);
     if (!session) return sendJSON(res, 401, { error: 'Faça login para ver sua agenda.' }, origin);
 
     try {
-      const stmt = db.prepare(`
-        SELECT id, titulo, descricao, data, horario, categoria, concluido, criado_em 
-        FROM compromissos 
-        WHERE usuario_id = ? 
-        ORDER BY data ASC, horario ASC, id DESC
-      `);
-      const items = stmt.all(session.id);
+      const items = await DB.getCompromissos(session.id);
       return sendJSON(res, 200, items, origin);
     } catch (err) {
       return sendJSON(res, 500, { error: 'Erro ao consultar banco de dados.' }, origin);
     }
   }
 
-  // POST /api/compromissos
+  // 8. POST /api/compromissos
   if (method === 'POST' && pathname === '/api/compromissos') {
-    const session = autenticarRequisicao(req);
+    const session = await autenticarRequisicao(req);
     if (!session) return sendJSON(res, 401, { error: 'Faça login.' }, origin);
 
     let body = '';
@@ -560,20 +678,16 @@ const server = http.createServer((req, res) => {
       body += chunk;
     });
 
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const data = JSON.parse(body);
 
-        // Validação de título
         if (!data.titulo || typeof data.titulo !== 'string' || data.titulo.trim().length === 0) {
           return sendJSON(res, 400, { error: 'Título é obrigatório.' }, origin);
         }
         const tituloClean = data.titulo.trim();
-        if (tituloClean.length > 100) {
-          return sendJSON(res, 400, { error: 'Título não pode exceder 100 caracteres.' }, origin);
-        }
+        if (tituloClean.length > 100) return sendJSON(res, 400, { error: 'Título não pode exceder 100 caracteres.' }, origin);
 
-        // Validação de data (formato ISO e não no passado)
         if (!data.data || typeof data.data !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(data.data)) {
           return sendJSON(res, 400, { error: 'Data em formato inválido. Use AAAA-MM-DD.' }, origin);
         }
@@ -583,7 +697,6 @@ const server = http.createServer((req, res) => {
           return sendJSON(res, 400, { error: 'Não é permitido criar compromissos em datas no passado.' }, origin);
         }
 
-        // Validação de horário
         let horarioClean = '';
         if (data.horario && typeof data.horario === 'string' && data.horario.trim() !== '') {
           horarioClean = data.horario.trim();
@@ -591,12 +704,7 @@ const server = http.createServer((req, res) => {
             return sendJSON(res, 400, { error: 'Horário em formato inválido. Use HH:MM.' }, origin);
           }
 
-          // Prevenção de conflito de horário (duplo agendamento)
-          const conflito = db.prepare(`
-            SELECT id, titulo FROM compromissos 
-            WHERE usuario_id = ? AND data = ? AND horario = ? AND concluido = 0
-          `).get(session.id, data.data, horarioClean);
-
+          const conflito = await DB.checkConflict(session.id, data.data, horarioClean);
           if (conflito) {
             return sendJSON(res, 409, { 
               error: `Você já possui o compromisso "${conflito.titulo}" agendado para às ${horarioClean}.` 
@@ -607,13 +715,7 @@ const server = http.createServer((req, res) => {
         const descricao = typeof data.descricao === 'string' ? data.descricao.slice(0, 1000).trim() : '';
         const categoria = ALLOWED_CATEGORIES.includes(data.categoria) ? data.categoria : 'Geral';
 
-        const stmt = db.prepare(`
-          INSERT INTO compromissos (usuario_id, titulo, descricao, data, horario, categoria, concluido)
-          VALUES (?, ?, ?, ?, ?, ?, 0)
-        `);
-        const result = stmt.run(session.id, tituloClean, descricao, data.data, horarioClean, categoria);
-
-        const newItem = db.prepare('SELECT * FROM compromissos WHERE id = ? AND usuario_id = ?').get(result.lastInsertRowid, session.id);
+        const newItem = await DB.createCompromisso(session.id, tituloClean, descricao, data.data, horarioClean, categoria);
         return sendJSON(res, 201, newItem, origin);
       } catch (err) {
         return sendJSON(res, 400, { error: 'Dados inválidos.' }, origin);
@@ -622,9 +724,9 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // PUT /api/compromissos/:id
+  // 9. PUT /api/compromissos/:id
   if (method === 'PUT' && pathname.startsWith('/api/compromissos/')) {
-    const session = autenticarRequisicao(req);
+    const session = await autenticarRequisicao(req);
     if (!session) return sendJSON(res, 401, { error: 'Faça login.' }, origin);
 
     const id = parseInt(pathname.split('/').pop(), 10);
@@ -632,17 +734,15 @@ const server = http.createServer((req, res) => {
 
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const data = JSON.parse(body);
         if (typeof data.concluido !== 'undefined') {
-          const stmt = db.prepare('UPDATE compromissos SET concluido = ? WHERE id = ? AND usuario_id = ?');
-          stmt.run(data.concluido ? 1 : 0, id, session.id);
+          const updated = await DB.updateStatus(id, session.id, data.concluido);
+          if (!updated) return sendJSON(res, 404, { error: 'Compromisso não encontrado no seu usuário.' }, origin);
+          return sendJSON(res, 200, updated, origin);
         }
-
-        const updated = db.prepare('SELECT * FROM compromissos WHERE id = ? AND usuario_id = ?').get(id, session.id);
-        if (!updated) return sendJSON(res, 404, { error: 'Compromisso não encontrado no seu usuário.' }, origin);
-        return sendJSON(res, 200, updated, origin);
+        return sendJSON(res, 400, { error: 'Dados inválidos.' }, origin);
       } catch (err) {
         return sendJSON(res, 400, { error: 'Dados inválidos.' }, origin);
       }
@@ -650,29 +750,24 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // DELETE /api/compromissos/:id (Protegido contra IDOR)
+  // 10. DELETE /api/compromissos/:id
   if (method === 'DELETE' && pathname.startsWith('/api/compromissos/')) {
-    const session = autenticarRequisicao(req);
+    const session = await autenticarRequisicao(req);
     if (!session) return sendJSON(res, 401, { error: 'Faça login.' }, origin);
 
     const id = parseInt(pathname.split('/').pop(), 10);
     if (isNaN(id) || id <= 0) return sendJSON(res, 400, { error: 'ID inválido.' }, origin);
 
     try {
-      const stmt = db.prepare('DELETE FROM compromissos WHERE id = ? AND usuario_id = ?');
-      const resDel = stmt.run(id, session.id);
-      if (resDel.changes === 0) {
-        return sendJSON(res, 404, { error: 'Compromisso não encontrado ou sem permissão.' }, origin);
-      }
+      const deleted = await DB.deleteCompromisso(id, session.id);
+      if (!deleted) return sendJSON(res, 404, { error: 'Compromisso não encontrado ou sem permissão.' }, origin);
       return sendJSON(res, 200, { success: true }, origin);
     } catch (err) {
       return sendJSON(res, 500, { error: 'Erro ao deletar.' }, origin);
     }
   }
 
-  // =========================================================================
-  // SERVIR ARQUIVOS ESTÁTICOS COM PROTEÇÃO PATH TRAVERSAL
-  // =========================================================================
+  // SERVIR ARQUIVOS ESTÁTICOS
   const FORBIDDEN_EXTENSIONS = ['.db', '.sqlite', '.sqlite3', '.env', '.json', '.bak', '.log'];
   const ext = path.extname(pathname).toLowerCase();
 
@@ -717,5 +812,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 Servidor SQLite WAL ativo em: http://localhost:${PORT}`);
+  console.log(`🚀 Servidor Agenda ativo na porta ${PORT} [Motor: ${isPostgres ? 'Neon Postgres' : 'SQLite'}]`);
 });
