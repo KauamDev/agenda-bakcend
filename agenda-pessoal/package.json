@@ -1,0 +1,21 @@
+{
+  "name": "agenda-pessoal-segura",
+  "version": "2.0.0",
+  "description": "Agenda Pessoal Segura com Autenticação e Banco de Dados SQLite em Modo WAL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "keywords": [
+    "agenda",
+    "sqlite",
+    "wal",
+    "auth",
+    "security"
+  ],
+  "author": "Farofa",
+  "license": "MIT"
+}

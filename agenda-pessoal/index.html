@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agenda Pessoal Segura | Login &amp; SQLite</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- ===================================================================
+       TELA DE AUTENTICAÇÃO (LOGIN / CADASTRO COM SENHA FORTE)
+       =================================================================== -->
+  <div class="auth-overlay" id="auth-overlay">
+    <div class="auth-card">
+      
+      <div class="auth-brand">
+        <div class="logo-mark">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="m9 16 2 2 4-4"/></svg>
+        </div>
+        <div>
+          <h2>AGENDA PESSOAL</h2>
+          <span class="auth-sub">Acesso protegido com Banco de Dados SQLite</span>
+        </div>
+      </div>
+
+      <!-- Abas: Entrar / Criar Conta -->
+      <div class="auth-tabs">
+        <button type="button" class="auth-tab-btn active" id="tab-login-btn">Fazer Login</button>
+        <button type="button" class="auth-tab-btn" id="tab-register-btn">Criar Conta</button>
+      </div>
+
+      <div id="auth-alert" class="auth-alert" style="display: none;"></div>
+
+      <!-- FORMULÁRIO DE LOGIN -->
+      <form id="login-form" class="auth-form">
+        <div class="auth-field">
+          <label for="login-email">Seu E-mail</label>
+          <input type="email" id="login-email" placeholder="nome@exemplo.com" required autocomplete="email">
+        </div>
+
+        <div class="auth-field">
+          <label for="login-password">Sua Senha</label>
+          <div class="input-pass-wrap">
+            <input type="password" id="login-password" placeholder="••••••••" required autocomplete="current-password">
+            <button type="button" class="btn-toggle-pass" id="btn-toggle-login-pass" aria-label="Mostrar senha" title="Mostrar/ocultar senha">👁️</button>
+          </div>
+        </div>
+
+        <div class="auth-options">
+          <label class="remember-checkbox-label">
+            <input type="checkbox" id="login-remember">
+            <span>Manter conectado neste aparelho</span>
+          </label>
+          <button type="button" id="btn-forgot-pass" class="btn-text-link">Esqueci a senha</button>
+        </div>
+
+        <button type="submit" class="btn-auth-submit" id="btn-login-submit">
+          <span>Entrar na Agenda</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        </button>
+      </form>
+
+      <!-- FORMULÁRIO DE RECUPERAÇÃO DE SENHA -->
+      <form id="recover-form" class="auth-form" style="display: none;">
+        <div id="recover-step-1">
+          <div class="auth-field">
+            <label for="recover-email">Seu E-mail Cadastrado</label>
+            <input type="email" id="recover-email" placeholder="nome@exemplo.com" required autocomplete="email">
+          </div>
+          <button type="button" class="btn-auth-submit" id="btn-send-code">
+            <span>Solicitar Código de Recuperação</span>
+          </button>
+        </div>
+
+        <div id="recover-step-2" style="display: none;">
+          <div class="auth-field">
+            <label for="recover-code">Código de 6 Dígitos</label>
+            <input type="text" id="recover-code" placeholder="Ex: 123456" maxlength="6" pattern="[0-9]{6}">
+          </div>
+          <div class="auth-field">
+            <label for="recover-new-password">Crie a Nova Senha Forte</label>
+            <div class="input-pass-wrap">
+              <input type="password" id="recover-new-password" placeholder="Mínimo 8 caracteres">
+              <button type="button" class="btn-toggle-pass" id="btn-toggle-rec-pass" aria-label="Mostrar senha">👁️</button>
+            </div>
+          </div>
+          <button type="submit" class="btn-auth-submit" id="btn-submit-reset">
+            <span>Redefinir Senha e Entrar</span>
+          </button>
+        </div>
+
+        <button type="button" class="btn-secondary-link" id="btn-back-to-login">
+          ← Voltar para o Login
+        </button>
+      </form>
+
+      <!-- FORMULÁRIO DE CADASTRO -->
+      <form id="register-form" class="auth-form" style="display: none;">
+        <div class="auth-field">
+          <label for="reg-name">Seu Nome</label>
+          <input type="text" id="reg-name" placeholder="Ex: Lucas Silva" required autocomplete="name">
+        </div>
+
+        <div class="auth-field">
+          <label for="reg-email">Seu E-mail</label>
+          <input type="email" id="reg-email" placeholder="nome@exemplo.com" required autocomplete="email">
+        </div>
+
+        <div class="auth-field">
+          <label for="reg-password">Crie uma Senha Forte</label>
+          <div class="input-pass-wrap">
+            <input type="password" id="reg-password" placeholder="Mínimo 8 caracteres com letras, números e símbolos" required autocomplete="new-password">
+            <button type="button" class="btn-toggle-pass" id="btn-toggle-reg-pass" aria-label="Mostrar senha" title="Mostrar/ocultar senha">👁️</button>
+          </div>
+          
+          <!-- Medidor visual de força da senha -->
+          <div class="password-meter-wrap">
+            <div class="meter-bar"><div class="meter-fill" id="pass-meter-fill"></div></div>
+            <span class="meter-label" id="pass-meter-label">Digite a senha...</span>
+          </div>
+
+          <!-- Checklist de Requisitos de Senha Forte -->
+          <ul class="pass-rules-list">
+            <li id="rule-len"><span class="rule-icon">○</span> Mínimo de 8 caracteres</li>
+            <li id="rule-upper"><span class="rule-icon">○</span> Letra maiúscula (A-Z)</li>
+            <li id="rule-lower"><span class="rule-icon">○</span> Letra minúscula (a-z)</li>
+            <li id="rule-num"><span class="rule-icon">○</span> Pelo menos um número (0-9)</li>
+            <li id="rule-spec"><span class="rule-icon">○</span> Caractere especial (!@#$%...)</li>
+          </ul>
+        </div>
+
+        <button type="submit" class="btn-auth-submit" id="btn-reg-submit" disabled>
+          <span>Criar Conta e Entrar</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+        </button>
+      </form>
+
+      <div class="auth-footer-security">
+        <span>🔒 Criptografia scrypt nativa &bull; Senhas salteadas &bull; Zero texto plano</span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ===================================================================
+       APLICAÇÃO DA AGENDA (PROTEGIDA POR LOGIN)
+       =================================================================== -->
+  <div class="app-layout" id="main-app" style="display: none;">
+    
+    <!-- BARRA LATERAL / SIDEBAR -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo-mark">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="m9 16 2 2 4-4"/></svg>
+        </div>
+        <div>
+          <h1 class="logo-title">AGENDA PESSOAL</h1>
+          <span class="db-indicator" id="db-status">
+            <span class="status-pulse"></span>
+            <span id="db-status-text">SQLite Conectado</span>
+          </span>
+        </div>
+      </div>
+
+      <!-- CARD DE PERFIL DO USUÁRIO LOGADO -->
+      <div class="user-profile-badge">
+        <div class="user-avatar-circle" id="user-avatar-letter">U</div>
+        <div class="user-info-text">
+          <strong id="user-display-name">Carregando...</strong>
+          <span id="user-display-email">usuario@email.com</span>
+        </div>
+        <button id="btn-logout" class="btn-logout-icon" title="Sair da Conta" aria-label="Sair">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+      </div>
+
+      <!-- MINI CALENDÁRIO VISUAL -->
+      <div class="calendar-widget">
+        <div class="calendar-header">
+          <button id="prev-month-btn" class="cal-nav-btn" aria-label="Mês anterior">&larr;</button>
+          <span id="calendar-month-year" class="cal-month-title">Novembro 2026</span>
+          <button id="next-month-btn" class="cal-nav-btn" aria-label="Próximo mês">&rarr;</button>
+        </div>
+        <div class="calendar-weekdays">
+          <span>D</span><span>S</span><span>T</span><span>Q</span><span>Q</span><span>S</span><span>S</span>
+        </div>
+        <div class="calendar-days" id="calendar-days">
+          <!-- Gerado dinamicamente -->
+        </div>
+      </div>
+
+      <!-- CONTADORES DE ESTATÍSTICA -->
+      <div class="stats-box">
+        <div class="stat-item">
+          <span class="stat-number" id="count-total">0</span>
+          <span class="stat-label">Total Salvo</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item">
+          <span class="stat-number highlight" id="count-pending">0</span>
+          <span class="stat-label">Pendentes</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item">
+          <span class="stat-number success" id="count-done">0</span>
+          <span class="stat-label">Concluídos</span>
+        </div>
+      </div>
+
+      <div class="db-info-footer">
+        <span class="db-file-tag">📁 Arquivo: <code>agenda.db</code></span>
+        <p>Seus compromissos são isolados e salvos de forma segura no banco de dados.</p>
+      </div>
+    </aside>
+
+    <!-- CONTEÚDO PRINCIPAL -->
+    <main class="main-content">
+      
+      <!-- TOPO COM BUSCA E DATA -->
+      <header class="content-header">
+        <div class="search-wrap">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <input type="text" id="search-input" placeholder="Buscar anotações, compromissos ou tarefas...">
+        </div>
+        
+        <div class="date-today-badge" id="current-date-badge">
+          Hoje
+        </div>
+      </header>
+
+      <!-- FORMULÁRIO DE NOVO COMPROMISSO -->
+      <section class="form-card">
+        <h2 class="form-title">Nova Anotação ou Compromisso</h2>
+        
+        <form id="agenda-form">
+          <div class="form-grid-top">
+            <div class="input-group flex-2">
+              <label for="input-title">O que você precisa lembrar?</label>
+              <input type="text" id="input-title" placeholder="Ex: Levar o carro na oficina, Reunião, Pagar conta" required autocomplete="off">
+            </div>
+
+            <div class="input-group">
+              <label for="input-date">Data</label>
+              <input type="date" id="input-date" required>
+            </div>
+
+            <div class="input-group">
+              <label for="input-time">Horário (Opcional)</label>
+              <input type="time" id="input-time">
+            </div>
+
+            <div class="input-group">
+              <label for="input-category">Categoria</label>
+              <select id="input-category">
+                <option value="Trabalho">💼 Trabalho</option>
+                <option value="Pessoal">👤 Pessoal</option>
+                <option value="Finanças">💰 Finanças</option>
+                <option value="Lembrete" selected>⏰ Lembrete</option>
+                <option value="Urgente">🚨 Urgente</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="input-group" style="margin-top: 14px;">
+            <label for="input-desc">Detalhes / Anotações complementares</label>
+            <textarea id="input-desc" rows="2" placeholder="Digite detalhes ou observações que você quer manter salvas..."></textarea>
+          </div>
+
+          <div class="form-footer">
+            <span class="auto-save-hint">⚡ Salva com isolamento de usuário no SQLite</span>
+            <button type="submit" class="btn-save" id="btn-save">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+              <span>Salvar na Agenda</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- BARRA DE FILTROS -->
+      <div class="filters-bar">
+        <div class="filter-tabs">
+          <button class="filter-tab active" data-filter="all">Todos (<span id="tab-all-count">0</span>)</button>
+          <button class="filter-tab" data-filter="today">Hoje (<span id="tab-today-count">0</span>)</button>
+          <button class="filter-tab" data-filter="pending">Pendentes (<span id="tab-pending-count">0</span>)</button>
+          <button class="filter-tab" data-filter="done">Concluídos (<span id="tab-done-count">0</span>)</button>
+        </div>
+
+        <div class="active-date-filter" id="active-date-filter" style="display: none;">
+          Filtrado por data: <strong id="filter-date-label"></strong>
+          <button id="clear-date-filter" title="Limpar filtro de data">&times;</button>
+        </div>
+      </div>
+
+      <!-- LISTA DE COMPROMISSOS -->
+      <section class="items-list-container">
+        <div id="items-list" class="items-list">
+          <!-- Renderizado via script.js -->
+        </div>
+
+        <!-- Estado Vazio -->
+        <div id="empty-state" class="empty-state" style="display: none;">
+          <div class="empty-icon">📝</div>
+          <h3>Sua agenda está vazia</h3>
+          <p>Adicione um compromisso ou anotação no formulário acima. Tudo ficará gravado no seu usuário.</p>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- CONTAINER DE TOAST / NOTIFICAÇÕES -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="script.js"></script>
+</body>
+</html>

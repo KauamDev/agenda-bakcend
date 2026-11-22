@@ -1,0 +1,2 @@
+/api/*  https://swaziland-worker-payroll-guarantees.trycloudflare.com/api/:splat  200!
+/*      /index.html                                                               200
